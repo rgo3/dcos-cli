@@ -2,7 +2,14 @@
 package cmd
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/dcos/dcos-cli/api"
 	"github.com/dcos/dcos-cli/pkg/cmd/auth"
@@ -10,7 +17,9 @@ import (
 	"github.com/dcos/dcos-cli/pkg/cmd/completion"
 	"github.com/dcos/dcos-cli/pkg/cmd/config"
 	plugincmd "github.com/dcos/dcos-cli/pkg/cmd/plugin"
+	"github.com/dcos/dcos-cli/pkg/cosmos"
 	"github.com/dcos/dcos-cli/pkg/plugin"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
 
@@ -24,9 +33,6 @@ func NewDCOSCommand(ctx api.Context) *cobra.Command {
 			cmd.SilenceUsage = true
 		},
 	}
-
-	// This global flag is handled outside of cobra. It is declared here to prevent the unknown flag error.
-	cmd.PersistentFlags().CountP("", "v", "")
 
 	cmd.AddCommand(
 		auth.NewCommand(ctx),
@@ -57,7 +63,7 @@ Examples:
 
 Commands:{{range .Commands}}{{if (or .IsAvailableCommand (eq .Name "help"))}}
   {{.Name}}
-      {{.Short}}{{end}}{{end}}{{end}}{{if .HasAvailableLocalFlags}}
+      {{.Short}}{{end}}{{end}}{{end}}{{if or .HasAvailableLocalFlags (ne (index .Annotations "` + annotationUsageOptions + `") "")}}
 
 Options:{{if ne (index .Annotations "` + annotationUsageOptions + `") ""}}{{index .Annotations "` + annotationUsageOptions + `"}}{{else}}
 {{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}{{end}}{{end}}{{if .HasAvailableSubCommands}}
@@ -92,15 +98,39 @@ func newPluginCommand(ctx api.Context, cmd plugin.Command) *cobra.Command {
 			for key, arg := range ctxArgs {
 				if arg == cmd.Name {
 					cmdArgs = ctxArgs[key:]
+					break
 				}
 			}
 
+			if len(cmdArgs) >= 3 && cmdArgs[0] == "package" && cmdArgs[1] == "install" && cmdArgs[2] == "dcos-core-cli" {
+				// This is a temporary fix in place for the core plugin not being able to update itself.
+				// In the long-term we should come-up with an installation system which is able to update
+				// running binary executables.
+				//
+				// https://jira.mesosphere.com/browse/DCOS_OSS-3985
+				// https://unix.stackexchange.com/questions/138214/how-is-it-possible-to-do-a-live-update-while-a-program-is-running#answer-138241
+				return updateCorePlugin(ctx)
+			}
+
+			executablePath, err := os.Executable()
+			if err != nil {
+				return err
+			}
 			execCmd := exec.Command(cmd.Path, cmdArgs...)
 			execCmd.Stdout = ctx.Out()
 			execCmd.Stderr = ctx.ErrOut()
 			execCmd.Stdin = ctx.Input()
 
-			err := execCmd.Run()
+			execCmd.Env = append(os.Environ(), "DCOS_CLI_EXECUTABLE_PATH="+executablePath)
+
+			switch ctx.Logger().Level {
+			case logrus.DebugLevel:
+				execCmd.Env = append(execCmd.Env, "DCOS_VERBOSITY=2", "DCOS_LOG_LEVEL=debug")
+			case logrus.InfoLevel:
+				execCmd.Env = append(execCmd.Env, "DCOS_VERBOSITY=1", "DCOS_LOG_LEVEL=info")
+			}
+
+			err = execCmd.Run()
 			if err != nil {
 				// Because we're silencing errors through Cobra, we need to print this separately.
 				ctx.Logger().Debug(err)
@@ -108,4 +138,38 @@ func newPluginCommand(ctx api.Context, cmd plugin.Command) *cobra.Command {
 			return err
 		},
 	}
+}
+
+// updateCorePlugin updates the core CLI plugin.
+func updateCorePlugin(ctx api.Context) error {
+	cluster, err := ctx.Cluster()
+	if err != nil {
+		return err
+	}
+	httpClient := ctx.HTTPClient(cluster)
+
+	// Get package information from Cosmos.
+	pkgInfo, err := cosmos.NewClient(httpClient).DescribePackage("dcos-core-cli")
+	if err != nil {
+		return err
+	}
+
+	// Get the download URL for the current platform.
+	p, ok := pkgInfo.Package.Resource.CLI.Plugins[runtime.GOOS]["x86-64"]
+	if !ok {
+		return fmt.Errorf("'dcos-core-cli' isn't available for '%s')", runtime.GOOS)
+	}
+	return ctx.PluginManager(cluster).Install(p.URL, &plugin.InstallOpts{
+		Name:   "dcos-core-cli",
+		Update: true,
+		PostInstall: func(fs afero.Fs, pluginDir string) error {
+			pkgInfoFilepath := filepath.Join(pluginDir, "package.json")
+			pkgInfoFile, err := fs.OpenFile(pkgInfoFilepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				return err
+			}
+			defer pkgInfoFile.Close()
+			return json.NewEncoder(pkgInfoFile).Encode(pkgInfo.Package)
+		},
+	})
 }

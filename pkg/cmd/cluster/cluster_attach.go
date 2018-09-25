@@ -25,11 +25,22 @@ func newCmdClusterAttach(ctx api.Context) *cobra.Command {
 				return err
 			}
 
-			// Get the link clusters.
-			currentCluster, err := ctx.Cluster()
-			if err != nil {
+			attachTo := func(conf *config.Config) error {
+				err := manager.Attach(conf)
+				if err == nil {
+					ctx.Logger().Infof("You are now attached to cluster %s", config.NewCluster(conf).ID())
+				}
 				return err
 			}
+
+			currentCluster, err := ctx.Cluster()
+			if err != nil {
+				if err == config.ErrConfigNotFound {
+					return attachTo(matchingConf)
+				}
+				return err
+			}
+
 			clusterLinker := linker.New(ctx.HTTPClient(currentCluster), ctx.Logger())
 			linkedClusters, err := clusterLinker.Links()
 			if err != nil {
@@ -37,15 +48,10 @@ func newCmdClusterAttach(ctx api.Context) *cobra.Command {
 			}
 
 			// We try to find a Link matching the argument given.
-			var matchingLinkedClusters []*linker.Link
+			ctx.Logger().Info("Looking for linked cluster...")
+			matchingLinkedClusters := linkedClusters[:0]
 			for _, linkedCluster := range linkedClusters {
-				if args[0] == linkedCluster.Name {
-					matchingLinkedClusters = append(matchingLinkedClusters, linkedCluster)
-				}
-				if args[0] == linkedCluster.ID {
-					matchingLinkedClusters = append(matchingLinkedClusters, linkedCluster)
-				}
-				if strings.HasPrefix(linkedCluster.ID, args[0]) {
+				if args[0] == linkedCluster.Name || strings.HasPrefix(linkedCluster.ID, args[0]) {
 					matchingLinkedClusters = append(matchingLinkedClusters, linkedCluster)
 				}
 			}
@@ -55,7 +61,7 @@ func newCmdClusterAttach(ctx api.Context) *cobra.Command {
 			case 0:
 				// No matching linked cluster, one matching cluster.
 				if matchingConf != nil {
-					return manager.Attach(matchingConf)
+					return attachTo(matchingConf)
 				}
 				// No matching linked cluster, no matching cluster.
 				return config.ErrConfigNotFound
@@ -65,7 +71,7 @@ func newCmdClusterAttach(ctx api.Context) *cobra.Command {
 					return config.ErrTooManyConfigs
 				}
 				// One matching linked cluster, no matching cluster.
-				flags := setup.NewFlags(ctx.Fs(), ctx.EnvLookup)
+				flags := setup.NewFlags(ctx.Fs(), ctx.EnvLookup, ctx.Logger())
 				flags.LoginFlags().SetProviderID(matchingLinkedClusters[0].LoginProvider.ID)
 				_, err := ctx.Setup(flags, matchingLinkedClusters[0].URL, true)
 				return err

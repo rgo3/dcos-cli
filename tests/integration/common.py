@@ -1,7 +1,6 @@
 import json
 import os
 import subprocess
-import sys
 import uuid
 
 import pytest
@@ -62,11 +61,21 @@ def default_cluster():
 
     yield cluster
 
-    code, _, _ = exec_cmd(['dcos', 'cluster', 'remove', cluster['name']])
+    code, _, _ = exec_cmd(['dcos', 'cluster', 'remove', cluster['cluster_id']])
     assert code == 0
 
 
-def _setup_cluster(name, with_plugins=True):
+@pytest.fixture()
+def default_cluster_with_plugins():
+    cluster = _setup_cluster('DEFAULT', with_plugins=True)
+
+    yield cluster
+
+    code, _, _ = exec_cmd(['dcos', 'cluster', 'remove', cluster['cluster_id']])
+    assert code == 0
+
+
+def _setup_cluster(name, with_plugins=False):
     cluster = {
         'variant': os.environ.get('DCOS_TEST_' + name + '_CLUSTER_VARIANT'),
         'username': os.environ.get('DCOS_TEST_' + name + '_CLUSTER_USERNAME'),
@@ -74,34 +83,17 @@ def _setup_cluster(name, with_plugins=True):
         'name': 'test_cluster_' + str(uuid.uuid4()),
     }
 
-    cmd = 'dcos cluster setup --name={} --username={} --password={} --no-plugin http://{}'.format(
+    cmd = 'dcos cluster setup --name={} --username={} --password={} http://{}'.format(
         cluster['name'],
         cluster['username'],
         cluster['password'],
         os.environ.get('DCOS_TEST_' + name + '_CLUSTER_HOST'))
 
+    if not with_plugins:
+        cmd += ' --no-plugin'
+
     code, _, _ = exec_cmd(cmd.split(' '))
     assert code == 0
-
-    if with_plugins:
-        # For now we install default plugins manually, this can be changed once universe packages are released.
-        plugins = {
-            'linux': [
-                'https://downloads.dcos.io/cli/plugins/dcos-core-cli/1.12/linux/x86-64/dcos-core-cli.zip',
-                'https://downloads.mesosphere.io/cli/binaries/linux/x86-64/1.4.5/61d301f571fe26883b5122d567ac4b79bae7febbd2090c81b6cdda523659eb43/dcos-enterprise-cli',
-            ],
-            'darwin': [
-                'https://downloads.dcos.io/cli/plugins/dcos-core-cli/1.12/darwin/x86-64/dcos-core-cli.zip',
-                'https://downloads.mesosphere.io/cli/binaries/darwin/x86-64/1.4.5/d0d160a3f1357e4c22792c3ba27e115f5eb7acb7a3c70ccb6f2bc6358e5e1e66/dcos-enterprise-cli',
-            ],
-            'win32': [
-                'https://downloads.dcos.io/cli/plugins/dcos-core-cli/1.12/windows/x86-64/dcos-core-cli.zip',
-                'https://downloads.mesosphere.io/cli/binaries/windows/x86-64/1.4.5/f5a58c636c8c3bb8e146958c7d4d06fcf1ca395757e49ffabb2ef04150e9ece9/dcos-enterprise-cli',
-            ],
-        }
-        for plugin in plugins[sys.platform]:
-            code, _, _ = exec_cmd(['dcos', 'plugin', 'add', plugin])
-            assert code == 0
 
     code, out, _ = exec_cmd(['dcos', 'cluster', 'list', '--json', '--attached'])
     clusters = json.loads(out)
@@ -110,5 +102,6 @@ def _setup_cluster(name, with_plugins=True):
 
     cluster['dcos_url'] = clusters[0]['url']
     cluster['version'] = clusters[0]['version']
+    cluster['cluster_id'] = clusters[0]['cluster_id']
 
     return cluster

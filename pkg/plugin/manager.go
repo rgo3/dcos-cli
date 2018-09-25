@@ -4,7 +4,10 @@ package plugin
 
 import (
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
+	"hash"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -47,6 +50,9 @@ type InstallOpts struct {
 	// Update allows to potentially overwrite an already existing plugin of the same name.
 	Update bool
 
+	// Checksum represents a CLI plugin resource content hash.
+	Checksum Checksum
+
 	// PostInstall is a hook which can be invoked after plugin installation.
 	// It is invoked right before the plugin is moved to its final location.
 	PostInstall func(fs afero.Fs, pluginDir string) error
@@ -55,14 +61,25 @@ type InstallOpts struct {
 	stagingDir string
 }
 
+// Checksum contains the hash function and the checksum we expect from a plugin.
+type Checksum struct {
+	Hasher hash.Hash
+	Value  string
+}
+
 // Install installs a plugin from a resource.
 func (m *Manager) Install(resource string, installOpts *InstallOpts) (err error) {
 	// If it's a remote resource, download it first.
+	m.logger.Infof("Installing plugin from %s...", resource)
 	if strings.HasPrefix(resource, "https://") || strings.HasPrefix(resource, "http://") {
-		installOpts.path, err = m.downloadPlugin(resource)
+		installOpts.path, err = m.downloadPlugin(resource, installOpts.Checksum)
 		if err != nil {
 			return err
 		}
+		// Remove the downloaded resource from the temp dir at the end of installation.
+		defer m.fs.RemoveAll(filepath.Dir(installOpts.path))
+	} else {
+		installOpts.path = resource
 	}
 
 	// The staging dir is where the plugin will be constructed
@@ -95,7 +112,12 @@ func (m *Manager) Remove(name string) error {
 	if !pluginDirExists {
 		return fmt.Errorf("'%s' is not a plugin directory", pluginDir)
 	}
-	return m.fs.RemoveAll(pluginDir)
+	err = m.fs.RemoveAll(pluginDir)
+	if err != nil {
+		return err
+	}
+	m.logger.Infof("Removed %s as a plugin from the CLI", name)
+	return nil
 }
 
 // Plugins returns the plugins associated with the current cluster.
@@ -236,7 +258,7 @@ func (m *Manager) pluginsDir() string {
 }
 
 // downloadPlugin downloads a plugin and returns the path to the temporary file it stored it to.
-func (m *Manager) downloadPlugin(url string) (string, error) {
+func (m *Manager) downloadPlugin(url string, checksum Checksum) (string, error) {
 	tmpDir, err := afero.TempDir(m.fs, os.TempDir(), "dcos-cli")
 	if err != nil {
 		return "", err
@@ -250,9 +272,24 @@ func (m *Manager) downloadPlugin(url string) (string, error) {
 
 	downloadedFilePath := filepath.Join(tmpDir, m.downloadFilename(resp))
 
-	if err := fsutil.CopyReader(m.fs, resp.Body, downloadedFilePath, 0644); err != nil {
+	var respReader io.Reader
+	if checksum.Hasher != nil {
+		respReader = io.TeeReader(resp.Body, checksum.Hasher)
+	} else {
+		respReader = resp.Body
+	}
+	if err := fsutil.CopyReader(m.fs, respReader, downloadedFilePath, 0644); err != nil {
 		return "", err
 	}
+
+	if checksum.Hasher != nil {
+		m.logger.Debugf("Verifying checksum for %s...", url)
+		computedChecksum := hex.EncodeToString(checksum.Hasher.Sum(nil))
+		if computedChecksum != checksum.Value {
+			return "", fmt.Errorf("computed checksum %s for %s, expected %s", computedChecksum, url, checksum.Value)
+		}
+	}
+
 	return downloadedFilePath, nil
 }
 
@@ -279,13 +316,15 @@ func (m *Manager) buildPlugin(installOpts *InstallOpts) error {
 		return err
 	}
 
+	envDir := filepath.Join(installOpts.stagingDir, "env")
+
 	switch contentType {
 	case "application/zip":
 		// Unzip the plugin into the staging dir and validate its plugin.toml, if any.
-		if err := fsutil.Unzip(m.fs, installOpts.path, installOpts.stagingDir); err != nil {
+		if err := fsutil.Unzip(m.fs, installOpts.path, envDir); err != nil {
 			return err
 		}
-		pluginFilePath := filepath.Join(installOpts.stagingDir, "plugin.toml")
+		pluginFilePath := filepath.Join(envDir, "plugin.toml")
 		if err := m.unmarshalPlugin(plugin, pluginFilePath); err != nil {
 			return err
 		}
@@ -298,12 +337,12 @@ func (m *Manager) buildPlugin(installOpts *InstallOpts) error {
 	// when it's not a ZIP archive.
 	default:
 		// Copy the binary into the staging dir's bin folder,
-		binDir := filepath.Join(installOpts.stagingDir, "bin")
+		binDir := filepath.Join(envDir, "bin")
 		if err := m.fs.MkdirAll(binDir, 0755); err != nil {
 			return err
 		}
 		binPath := filepath.Join(binDir, filepath.Base(installOpts.path))
-		err := fsutil.Copy(m.fs, installOpts.path, binPath, 0751)
+		err := fsutil.CopyFile(m.fs, installOpts.path, binPath, 0751)
 		if err != nil {
 			return err
 		}
@@ -323,7 +362,7 @@ func (m *Manager) buildPlugin(installOpts *InstallOpts) error {
 // installPlugin installs a plugin from a staging dir into its final location.
 // "update" indicates whether an already existing plugin can be overwritten.
 func (m *Manager) installPlugin(installOpts *InstallOpts) error {
-	dest := filepath.Join(m.pluginsDir(), installOpts.Name, "env")
+	dest := filepath.Join(m.pluginsDir(), installOpts.Name)
 
 	if installOpts.Update {
 		if err := m.fs.RemoveAll(dest); err != nil {
@@ -339,11 +378,15 @@ func (m *Manager) installPlugin(installOpts *InstallOpts) error {
 		}
 	}
 
-	// Move the plugin folder to the final location.
 	if err := m.fs.MkdirAll(filepath.Dir(dest), 0755); err != nil {
 		return err
 	}
-	return m.fs.Rename(installOpts.stagingDir, dest)
+
+	// Copy the plugin folder to its final location. We don't move it as this causes
+	// issues when the system's temp dir and the DC/OS dir are on different devices.
+	// See https://groups.google.com/forum/m/#!topic/golang-dev/5w7Jmg_iCJQ.
+	defer m.fs.RemoveAll(installOpts.stagingDir)
+	return fsutil.CopyDir(m.fs, installOpts.stagingDir, dest)
 }
 
 // httpClient returns the appropriate HTTP client for a given resource.

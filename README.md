@@ -22,7 +22,7 @@ available in the [DC/OS docs](https://dcos.io/docs/).
 
 1.  [git](http://git-scm.com) must be installed to download the source
     code for the DC/OS CLI.
-2.  [go](https://golang.org/dl/) 1.10+ or docker.
+2.  [go](https://golang.org/dl/) 1.11+ or docker.
 3.  [win-bash](https://sourceforge.net/projects/win-bash/files/shell-complete/latest)
    must be installed if you are using Windows in order to run setup scripts
    from the Makefile.
@@ -45,11 +45,20 @@ available in the [DC/OS docs](https://dcos.io/docs/).
 
 1.  Clone git repo for the dcos cli:
 
+        git clone git@github.com:dcos/dcos-cli.git
+
+    or:
+
         go get github.com/dcos/dcos-cli
 
 2.  Change directory to the repo directory:
 
+        cd project/path/outside/$GOPATH/dcos-cli
+
+    or:
+
         cd $GOPATH/src/github.com/dcos/dcos-cli
+        export GO111MODULE=on
 
 3.  Build the binary:
 
@@ -80,7 +89,7 @@ Using a Python virtual environment is recommended.
 
 ## Releasing
 
-Releasing a new version of the DC/OS CLI is done thourgh an
+Releasing a new version of the DC/OS CLI is done through an
 [automated Jenkins
 build](https://jenkins.mesosphere.com/service/jenkins/job/public-dcos-cluster-ops/job/mesosphere-dcos-cli/job/release/)
 which is triggered automatically for new tags and on pushes to master.
@@ -99,4 +108,5 @@ Tags are released to:
 
 ## Contributing
 
-Contributions are always welcome! Please refer to our [contributing guidelines](https://github.com/dcos/dcos-cli/blob/master/CONTRIBUTING.md) and [style guide](https://github.com/dcos/dcos-cli/blob/master/STYLEGUIDE.md) first.
+Contributions are always welcome! Please refer to our [contributing guidelines](CONTRIBUTING.md).
+

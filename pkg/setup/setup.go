@@ -33,33 +33,39 @@ import (
 
 // Opts are options for a setup.
 type Opts struct {
+	Fs            afero.Fs
 	Errout        io.Writer
 	Prompt        *prompt.Prompt
 	Logger        *logrus.Logger
 	LoginFlow     *login.Flow
 	ConfigManager *config.Manager
 	PluginManager *plugin.Manager
+	EnvLookup     func(key string) (string, bool)
 }
 
 // Setup represents a cluster setup.
 type Setup struct {
+	fs            afero.Fs
 	errout        io.Writer
 	prompt        *prompt.Prompt
 	logger        *logrus.Logger
 	loginFlow     *login.Flow
 	configManager *config.Manager
 	pluginManager *plugin.Manager
+	envLookup     func(key string) (string, bool)
 }
 
 // New creates a new setup.
 func New(opts Opts) *Setup {
 	return &Setup{
+		fs:            opts.Fs,
 		errout:        opts.Errout,
 		prompt:        opts.Prompt,
 		logger:        opts.Logger,
 		loginFlow:     opts.LoginFlow,
 		configManager: opts.ConfigManager,
 		pluginManager: opts.PluginManager,
+		envLookup:     opts.EnvLookup,
 	}
 }
 
@@ -68,6 +74,8 @@ func (s *Setup) Configure(flags *Flags, clusterURL string, attach bool) (*config
 	if err := flags.Resolve(); err != nil {
 		return nil, err
 	}
+
+	s.logger.Info("Setting up the cluster...")
 
 	// Create a Cluster and an HTTP client with the few information already available.
 	cluster := config.NewCluster(nil)
@@ -89,14 +97,18 @@ func (s *Setup) Configure(flags *Flags, clusterURL string, attach bool) (*config
 		httpOpts = append(httpOpts, httpclient.TLS(tlsConfig))
 	}
 
-	// Login to get the ACS token.
-	httpClient := httpclient.New(cluster.URL(), httpOpts...)
-	acsToken, err := s.loginFlow.Start(flags.loginFlags, httpClient)
-	if err != nil {
-		return nil, err
+	// Login to get the ACS token, unless it is already present as an env var.
+	acsToken, _ := s.envLookup("DCOS_CLUSTER_SETUP_ACS_TOKEN")
+	if acsToken == "" {
+		httpClient := httpclient.New(cluster.URL(), httpOpts...)
+		var err error
+		acsToken, err = s.loginFlow.Start(flags.loginFlags, httpClient)
+		if err != nil {
+			return nil, err
+		}
 	}
 	cluster.SetACSToken(acsToken)
-	httpClient = httpclient.New(cluster.URL(), append(httpOpts, httpclient.ACSToken(acsToken))...)
+	httpClient := httpclient.New(cluster.URL(), append(httpOpts, httpclient.ACSToken(cluster.ACSToken()))...)
 
 	// Read cluster ID from cluster metadata.
 	metadata, err := dcos.NewClient(httpClient).Metadata()
@@ -126,6 +138,7 @@ func (s *Setup) Configure(flags *Flags, clusterURL string, attach bool) (*config
 		if err != nil {
 			return nil, err
 		}
+		s.logger.Infof("You are now attached to cluster %s", cluster.ID())
 	}
 
 	// Install default plugins (dcos-core-cli and dcos-enterprise-cli).
@@ -136,6 +149,7 @@ func (s *Setup) Configure(flags *Flags, clusterURL string, attach bool) (*config
 		}
 	}
 
+	s.logger.Infof("%s is now setup", clusterURL)
 	return cluster, nil
 }
 
@@ -280,17 +294,27 @@ func (s *Setup) installDefaultPlugins(httpClient *httpclient.Client) error {
 		close(enterpriseInstallErr)
 	}()
 
-	err = s.installPlugin("dcos-core-cli", httpClient)
-	if err != nil {
-		// We don't return an error as the EE plugin is not as useful as the core plugin.
-		return fmt.Errorf("unable to install DC/OS core CLI plugin: %s", err)
-	}
+	// Install dcos-core-cli.
+	errCore := s.installPlugin("dcos-core-cli", httpClient)
 
 	// The installation of the core and EE plugins happen in parallel.
 	// We wait for the installation of the enterprise plugin before returning.
-	err = <-enterpriseInstallErr
-	if err != nil {
-		return fmt.Errorf("unable to install DC/OS enterprise CLI plugin: %s", err)
+	errEnterprise := <-enterpriseInstallErr
+
+	if errCore != nil {
+		// Check that the version is 1.12 and if so, try to install the bundled plugin.
+		if versionNumber(version.Version) != "1.12" {
+			return fmt.Errorf("unable to install DC/OS core CLI plugin: %s", errCore)
+		}
+		err = s.installBundledPlugin()
+		if err != nil {
+			return fmt.Errorf("unable to install DC/OS core CLI plugin: %s", err)
+		}
+	}
+
+	if errEnterprise != nil {
+		// We don't error-out as failing to install the EE plugin isn't critical to the operation.
+		s.logger.Error(`In order to install the "dcos-enterprise-cli" plugin, make sure your user has the "dcos:adminrouter:package" permission and run "dcos package install dcos-enterprise-cli".`)
 	}
 	return nil
 }
@@ -310,9 +334,19 @@ func (s *Setup) installPlugin(name string, httpClient *httpclient.Client) error 
 	if !ok {
 		return fmt.Errorf("'%s' isn't available for '%s')", name, runtime.GOOS)
 	}
+
+	var checksum plugin.Checksum
+	for _, contentHash := range p.ContentHash {
+		switch contentHash.Algo {
+		case "sha256":
+			checksum.Hasher = sha256.New()
+			checksum.Value = contentHash.Value
+		}
+	}
 	return s.pluginManager.Install(p.URL, &plugin.InstallOpts{
-		Name:   pkgInfo.Package.Name,
-		Update: true,
+		Name:     pkgInfo.Package.Name,
+		Update:   true,
+		Checksum: checksum,
 		PostInstall: func(fs afero.Fs, pluginDir string) error {
 			pkgInfoFilepath := filepath.Join(pluginDir, "package.json")
 			pkgInfoFile, err := fs.OpenFile(pkgInfoFilepath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -348,7 +382,7 @@ func (s *Setup) promptCA(cert *x509.Certificate) error {
 
   SHA256 fingerprint: %s
 
-Do you trust it?`
+Do you trust it? [y/n] `
 
 	return s.prompt.Confirm(fmt.Sprintf(
 		msg,
@@ -356,5 +390,44 @@ Do you trust it?`
 		cert.NotBefore,
 		cert.NotAfter,
 		fingerprintBuf.String(),
-	))
+	), "")
+}
+
+// installBundledPlugin installs the default core plugin bundled with the wrapper CLI.
+//
+// This will occur for two primary reasons:
+// 1. The cluster and the computer running setup are airgapped. By default the resources describing
+// where the core plugins are point to S3 which will be unreachable in an airgapped environment.
+// 2. The user running setup does not have permission to access Cosmos (dcos:adminrouter:package).
+//
+// Though a user could install the core plugin manually, this will prevent usability regressions until
+// other features of DC/OS are there to allow the normal path to handle all cases.
+func (s *Setup) installBundledPlugin() error {
+	pluginData, err := Asset("core.zip")
+	if err != nil {
+		return err
+	}
+
+	// Write out the data into a temp directory so that it's in the real filesystem for buildPlugin
+	pluginFile, err := afero.TempFile(s.fs, os.TempDir(), "dcos-core-cli.zip")
+	if err != nil {
+		return err
+	}
+	defer s.fs.Remove(pluginFile.Name())
+	defer pluginFile.Close()
+	_, err = pluginFile.Write(pluginData)
+	if err != nil {
+		return err
+	}
+
+	return s.pluginManager.Install(pluginFile.Name(), &plugin.InstallOpts{
+		Update: true,
+	})
+}
+
+// versionNumber takes in a version string and strips pulls out the number portion (strips off trailing -dev)
+func versionNumber(version string) string {
+	versionMatcher := regexp.MustCompile(`^(1.\d+)\D*`)
+	v := versionMatcher.FindStringSubmatch(version)
+	return v[1]
 }

@@ -13,7 +13,7 @@ import (
 
 // newCmdClusterLink links the attached cluster to another one.
 func newCmdClusterLink(ctx api.Context) *cobra.Command {
-	setupFlags := setup.NewFlags(ctx.Fs(), ctx.EnvLookup)
+	setupFlags := setup.NewFlags(ctx.Fs(), ctx.EnvLookup, ctx.Logger())
 	cmd := &cobra.Command{
 		Use:   "link <cluster>",
 		Short: "Link the current cluster to another one",
@@ -32,7 +32,7 @@ func newCmdClusterLink(ctx api.Context) *cobra.Command {
 					return err
 				}
 
-				err = ctx.Prompt().Confirm("The cluster you want to link to is not set up locally, would you like to do it now?")
+				err = ctx.Prompt().Confirm("The cluster you want to link to is not set up locally, would you like to do it now? [Y/n] ", "Y")
 				if err != nil {
 					return err
 				}

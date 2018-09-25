@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/dcos/dcos-cli/api"
@@ -13,62 +14,66 @@ import (
 	"github.com/dcos/dcos-cli/pkg/dcos"
 	"github.com/dcos/dcos-cli/pkg/httpclient"
 	"github.com/sirupsen/logrus"
-	"github.com/spf13/afero"
-	"github.com/spf13/pflag"
 )
 
 func main() {
-	ctx := cli.NewContext(&cli.Environment{
-		Args:      os.Args,
-		Input:     os.Stdin,
-		Out:       os.Stdout,
-		ErrOut:    os.Stderr,
-		EnvLookup: os.LookupEnv,
-		Fs:        afero.NewOsFs(),
-	})
-
-	if err := run(ctx, os.Args); err != nil {
+	if err := run(cli.NewOsEnvironment()); err != nil {
 		os.Exit(1)
 	}
 }
 
-// run launches the DC/OS CLI with a given context and args.
-func run(ctx api.Context, args []string) error {
-	var verbosity int
-	var showVersion bool
+// run launches the DC/OS CLI with a given environment.
+func run(env *cli.Environment) error {
+	globalFlags := &cli.GlobalFlags{}
+	env.Args = append(env.Args[:1], globalFlags.Parse(env.Args[1:])...)
 
-	// Register the version and verbose global flags.
-	// We ContinueOnError because we don't want to fail for subcommand specific flags.
-	// We discard any output because we don't want the `-h` flag to trigger usage on this flagset.
-	globalFlags := pflag.NewFlagSet(args[0], pflag.ContinueOnError)
-	globalFlags.SetOutput(ioutil.Discard)
-	globalFlags.BoolVar(&showVersion, "version", false, "")
-	globalFlags.CountVarP(&verbosity, "", "v", "")
-	globalFlags.Parse(args[1:])
+	if globalFlags.Verbosity == 0 {
+		if envVerbosity, ok := env.EnvLookup("DCOS_VERBOSITY"); ok {
+			globalFlags.Verbosity, _ = strconv.Atoi(envVerbosity)
+		}
+	}
+	if globalFlags.Debug {
+		globalFlags.LogLevel = "debug"
+		fmt.Fprintln(env.ErrOut, "The --debug flag is deprecated. Please use the -vv flag.")
+	}
 
-	ctx.Logger().SetLevel(logLevel(verbosity))
+	ctx := cli.NewContext(env)
+	ctx.Logger().SetLevel(logrusLevel(env.ErrOut, globalFlags.Verbosity, globalFlags.LogLevel))
 
-	if showVersion {
+	if globalFlags.Version {
 		printVersion(ctx)
 		return nil
 	}
-	return cmd.NewDCOSCommand(ctx).Execute()
+	dcosCmd := cmd.NewDCOSCommand(ctx)
+	dcosCmd.SetArgs(env.Args[1:])
+	return dcosCmd.Execute()
 }
 
-// logLevel returns the log level for the CLI based on the verbosity. The default verbosity is 0.
-func logLevel(verbosity int) logrus.Level {
-	switch verbosity {
-	case 0:
-		// Without the verbose flag, default to error level.
-		return logrus.ErrorLevel
-	case 1:
-		// -v sets the logger level to info.
-		return logrus.InfoLevel
-	default:
+// logrusLevel returns the log level for the CLI based on the verbosity. The default verbosity is 0.
+func logrusLevel(errout io.Writer, verbosity int, logLevel string) logrus.Level {
+	if verbosity > 1 {
 		// -vv sets the logger level to debug. This also happens for -vvv
 		// and above, in such cases we set the logging level to its maximum.
 		return logrus.DebugLevel
 	}
+
+	if verbosity == 1 {
+		// -v sets the logger level to info.
+		return logrus.InfoLevel
+	}
+
+	switch logLevel {
+	case "debug":
+		fmt.Fprintln(errout, "The --log-level flag is deprecated. Please use the -vv flag.")
+		return logrus.DebugLevel
+	case "info", "warning":
+		fmt.Fprintln(errout, "The --log-level flag is deprecated. Please use the -v flag.")
+		return logrus.InfoLevel
+	case "error", "critical":
+		fmt.Fprintf(errout, "The --log-level=%s flag is deprecated. It is enabled by default.\n", logLevel)
+	}
+	// Without the verbose flag, default to error level.
+	return logrus.ErrorLevel
 }
 
 // printVersion prints CLI version information.

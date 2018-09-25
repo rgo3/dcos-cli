@@ -12,7 +12,9 @@ pipeline {
       agent { label 'mesos-ubuntu' }
 
       steps {
-          sh 'make linux darwin windows'
+          sh 'make core-download'
+          sh 'make core-bundle'
+          sh 'GO_BUILD_TAGS=corecli make linux darwin windows'
           stash includes: 'build/linux/**', name: 'dcos-linux'
           stash includes: 'build/darwin/**', name: 'dcos-darwin'
           stash includes: 'build/windows/**', name: 'dcos-windows'
@@ -31,6 +33,9 @@ pipeline {
           [$class: 'StringBinding',
           credentialsId: '0b513aad-e0e0-4a82-95f4-309a80a02ff9',
           variable: 'DCOS_TEST_INSTALLER_URL'],
+          [$class: 'FileBinding',
+          credentialsId: '23743034-1ac4-49f7-b2e6-a661aee2d11b',
+          variable: 'DCOS_TEST_SSH_KEY_PATH'],
           [$class: 'StringBinding',
           credentialsId: 'ca159ad3-7323-4564-818c-46a8f03e1389',
           variable: 'DCOS_TEST_LICENSE']
@@ -62,6 +67,7 @@ pipeline {
                 bash -exc " \
                   PATH=$PWD/build/linux:$PATH; \
                   cd tests; \
+                  dcos cluster remove --all; \
                   python3 -m venv env; \
                   source env/bin/activate; \
                   source test_cluster.env.sh; \
@@ -85,6 +91,7 @@ pipeline {
                   export PYTHONIOENCODING=utf-8; \
                   PATH=$PWD/build/darwin:$PATH; \
                   cd tests; \
+                  dcos cluster remove --all; \
                   python3 -m venv env; \
                   source env/bin/activate; \
                   source test_cluster.env.sh; \
@@ -110,9 +117,9 @@ pipeline {
               bat '''
                 bash -exc " \
                   export PYTHONIOENCODING=utf-8; \
-                  rm -rf ${HOME}/.dcos; \
                   PATH=$PWD/build/windows:$PATH; \
                   cd tests; \
+                  dcos cluster remove --all; \
                   source test_cluster.env.sh; \
                   python -m venv env; \
                   env/Scripts/python -m pip install -U pip; \
